@@ -1,0 +1,602 @@
+# ============================================================================
+# ESPHome – fancoil with MD1001 controller board over RS485 / Modbus RTU
+# ============================================================================
+# Tested on a Climasol LTV-080/CW water-cooled fancoil (MD1001-type board),
+# driven by an M5Stack Atom Lite with the Atomic RS485 Base.
+#
+# Register map: ../documents/MD1001-modbus-registers.md
+#
+#   Modbus RTU, 9600 8N1, slave address 15 (panel parameter P14).
+#   Read only with function code 03, write only with 16 (06 is not supported).
+#   The only readable block is 28301..28327.
+#
+#     28301  power              0 = off, 1 = on
+#     28302  mode               0 auto, 1 cool, 2 dry, 3 fan only, 4 heat
+#     28303  fan speed          2 low, 3 medium, 4 high, 6 auto
+#     28308+ parameters         register = 28307 + parameter number (P01..P20)
+#
+#   Temperatures are in tenths of a degree Celsius. The room temperature is
+#   NOT available over Modbus.
+#
+# QUIRK: the board answers with address byte 0x00 instead of its own address
+# (the CRC is calculated over that 0x00 and is valid). ESPHome's
+# modbus_controller rejects every such reply, so the frames are built and
+# parsed by hand on the UART below.
+#
+# One file per fancoil: copy this file, change device_name and friendly_name.
+# ============================================================================
+
+substitutions:
+  device_name: fancoil-living-room
+  friendly_name: Fancoil Living Room
+  board_type: m5stack-atom                       # Atom Lite (ESP32-PICO-D4)
+  # Atomic RS485 Base on an Atom Lite: TX GPIO19, RX GPIO22.
+  # On an AtomS3 Lite use board esp32-s3-devkitc-1 and TX GPIO6, RX GPIO5.
+  uart_tx_pin: "GPIO19"
+  uart_rx_pin: "GPIO22"
+  uart_baud: "9600"
+  fancoil_address: "15"                          # panel parameter P14
+  block_start: "28301"                           # 0x6E8D
+  block_count: "27"                              # up to 28327, the full readable block
+  log_level: INFO
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: MD1001 fancoil via Modbus RTU
+
+esp32:
+  board: ${board_type}
+  framework:
+    type: arduino
+
+logger:
+  level: ${log_level}
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: NONE
+  ap:
+    ssid: "${friendly_name} Hotspot"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+globals:
+  - id: rv                       # register values, index n = register 28301 + n
+    type: int[32]
+    restore_value: no
+  - id: have_data
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+  - id: last_rx                  # millis() of the last valid read reply
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+uart:
+  id: bus
+  tx_pin: ${uart_tx_pin}
+  rx_pin: ${uart_rx_pin}
+  baud_rate: ${uart_baud}
+  parity: NONE
+  stop_bits: 1
+  data_bits: 8
+  rx_buffer_size: 512
+  # The debug hook is used as the receiver: it hands every incoming frame to
+  # the lambda below.
+  debug:
+    direction: RX
+    dummy_receiver: true
+    after:
+      bytes: 128
+      timeout: 15ms
+    sequence:
+      - lambda: |-
+          size_t n = bytes.size();
+          if (n < 3) return;
+          const uint8_t WANT_BC = (uint8_t)(${block_count} * 2);
+
+          // Only look at the first few positions. The address byte is 0x00 and
+          // sometimes a glitch byte precedes it. Searching further could
+          // mistake a data byte for a function code.
+          for (size_t i = 0; i < 3 && i + 1 < n; i++) {
+            uint8_t b = bytes[i];
+
+            if (b == 0x83) { ESP_LOGW("fc", "read error, exception code %u", bytes[i + 1]); return; }
+            if (b == 0x90) { ESP_LOGW("fc", "write rejected, exception code %u", bytes[i + 1]); return; }
+
+            // write confirmation: address, 0x10, start register, count, crc
+            if (b == 0x10 && i + 5 < n) {
+              int reg = (int)(((uint16_t) bytes[i + 1] << 8) | bytes[i + 2]);
+              ESP_LOGI("fc", "register %d written", reg);
+              return;
+            }
+
+            // read reply for the full block
+            if (b == 0x03 && bytes[i + 1] == WANT_BC && i + 2 < n) {
+              for (int w = 0; w < ${block_count} && w < 32; w++) {
+                size_t p = i + 2 + (size_t) w * 2;
+                if (p + 1 >= n) break;
+                id(rv)[w] = (int)(((uint16_t) bytes[p] << 8) | bytes[p + 1]);
+              }
+              id(have_data) = true;
+              id(last_rx) = millis();
+              return;
+            }
+          }
+
+# ---------------------------------------------------------------------------
+# Building and sending frames
+# ---------------------------------------------------------------------------
+script:
+  # read the full block with function code 03
+  - id: read_block
+    mode: queued
+    then:
+      - lambda: |-
+          const int reg = ${block_start}, cnt = ${block_count};
+          uint8_t f[8];
+          f[0] = (uint8_t)${fancoil_address};
+          f[1] = 0x03;
+          f[2] = (uint8_t)((reg >> 8) & 0xFF);
+          f[3] = (uint8_t)(reg & 0xFF);
+          f[4] = (uint8_t)((cnt >> 8) & 0xFF);
+          f[5] = (uint8_t)(cnt & 0xFF);
+          uint16_t crc = 0xFFFF;
+          for (int i = 0; i < 6; i++) {
+            crc ^= (uint16_t) f[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001) : (uint16_t)(crc >> 1);
+          }
+          f[6] = (uint8_t)(crc & 0xFF);
+          f[7] = (uint8_t)((crc >> 8) & 0xFF);
+          id(bus).write_array(f, 8);
+          id(bus).flush();
+
+  # write one register with function code 16 (count 1)
+  - id: send_write16
+    mode: queued
+    parameters:
+      reg: int
+      val: int
+    then:
+      - lambda: |-
+          uint8_t f[11];
+          f[0]  = (uint8_t)${fancoil_address};
+          f[1]  = 0x10;
+          f[2]  = (uint8_t)((reg >> 8) & 0xFF);
+          f[3]  = (uint8_t)(reg & 0xFF);
+          f[4]  = 0x00;
+          f[5]  = 0x01;                      // one register
+          f[6]  = 0x02;                      // two data bytes
+          f[7]  = (uint8_t)((val >> 8) & 0xFF);
+          f[8]  = (uint8_t)(val & 0xFF);
+          uint16_t crc = 0xFFFF;
+          for (int i = 0; i < 9; i++) {
+            crc ^= (uint16_t) f[i];
+            for (int b = 0; b < 8; b++)
+              crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001) : (uint16_t)(crc >> 1);
+          }
+          f[9]  = (uint8_t)(crc & 0xFF);
+          f[10] = (uint8_t)((crc >> 8) & 0xFF);
+          id(bus).write_array(f, 11);
+          id(bus).flush();
+
+  # write one register, then read the block back straight away
+  - id: write_reg
+    mode: queued
+    parameters:
+      reg: int
+      val: int
+    then:
+      - script.execute:
+          id: send_write16
+          reg: !lambda 'return reg;'
+          val: !lambda 'return val;'
+      - delay: 400ms
+      # After a new setpoint, write the current mode again so the board
+      # reloads its control loop and uses the new setpoint immediately.
+      - if:
+          condition:
+            lambda: 'return reg >= 28310 && reg <= 28313;'
+          then:
+            - script.execute:
+                id: send_write16
+                reg: 28302
+                val: !lambda 'return id(rv)[1];'
+            - delay: 400ms
+      - script.execute: read_block
+
+interval:
+  - interval: 3s
+    then:
+      - script.execute: read_block
+
+# ---------------------------------------------------------------------------
+# Control
+# ---------------------------------------------------------------------------
+switch:
+  - platform: template
+    name: "Fancoil"
+    icon: mdi:fan
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[0] == 1;
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28301, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28301, val: 0}
+
+  # ---- settings, on/off parameters ----
+  - platform: template
+    name: "P08 Fan stop on warm cooling coil"
+    icon: mdi:fan-off
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[14] == 1;            // 28315
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28315, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28315, val: 0}
+
+  - platform: template
+    name: "P09 Ultra-low fan speed"
+    icon: mdi:fan-speed-1
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[15] == 1;            // 28316
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28316, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28316, val: 0}
+
+  - platform: template
+    name: "P10 Water valve or relay present"
+    icon: mdi:valve
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[16] == 1;            // 28317
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28317, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28317, val: 0}
+
+  - platform: template
+    name: "P11 Floor heating"
+    icon: mdi:heating-coil
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[17] == 1;            // 28318
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28318, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28318, val: 0}
+
+  - platform: template
+    name: "P15 Key lock"
+    icon: mdi:lock
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[21] == 1;            // 28322
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28322, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28322, val: 0}
+
+  - platform: template
+    name: "P16 Remote works while locked"
+    icon: mdi:remote
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[22] == 1;            // 28323
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28323, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28323, val: 0}
+
+  - platform: template
+    name: "P17 Password required to lock"
+    icon: mdi:form-textbox-password
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[23] == 1;            // 28324
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28324, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28324, val: 0}
+
+  - platform: template
+    name: "P20 Fan pulses in auto mode"
+    icon: mdi:fan-auto
+    entity_category: config
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[26] == 1;            // 28327
+    turn_on_action:
+      - script.execute: {id: write_reg, reg: 28327, val: 1}
+    turn_off_action:
+      - script.execute: {id: write_reg, reg: 28327, val: 0}
+
+number:
+  - platform: template
+    name: "Heating setpoint"
+    icon: mdi:thermometer-plus
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 5
+    max_value: 35
+    step: 0.5
+    update_interval: 3s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[10] / 10.0f;         // 28311, P04
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28311
+          val: !lambda 'return (int) lroundf(x * 10.0f);'
+
+  - platform: template
+    name: "Cooling setpoint"
+    icon: mdi:thermometer-minus
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 5
+    max_value: 35
+    step: 0.5
+    update_interval: 3s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[9] / 10.0f;          // 28310, P03
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28310
+          val: !lambda 'return (int) lroundf(x * 10.0f);'
+
+  - platform: template
+    name: "Auto mode cooling setpoint"
+    icon: mdi:thermometer-auto
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 5
+    max_value: 35
+    step: 0.5
+    update_interval: 3s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[11] / 10.0f;         // 28312, P05
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28312
+          val: !lambda 'return (int) lroundf(x * 10.0f);'
+
+  - platform: template
+    name: "Auto mode heating setpoint"
+    icon: mdi:thermometer-auto
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 5
+    max_value: 35
+    step: 0.5
+    update_interval: 3s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[12] / 10.0f;         // 28313, P06
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28313
+          val: !lambda 'return (int) lroundf(x * 10.0f);'
+
+  # ---- settings, numeric parameters ----
+  # P01 and P02 clamp all setpoints above.
+  - platform: template
+    name: "P01 Maximum setpoint"
+    icon: mdi:thermometer-chevron-up
+    entity_category: config
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 5
+    max_value: 35
+    step: 0.5
+    update_interval: 10s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[7] / 10.0f;          // 28308
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28308
+          val: !lambda 'return (int) lroundf(x * 10.0f);'
+
+  - platform: template
+    name: "P02 Minimum setpoint"
+    icon: mdi:thermometer-chevron-down
+    entity_category: config
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 5
+    max_value: 35
+    step: 0.5
+    update_interval: 10s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[8] / 10.0f;          // 28309
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28309
+          val: !lambda 'return (int) lroundf(x * 10.0f);'
+
+  - platform: template
+    name: "P07 Fan stop below coil temperature"
+    icon: mdi:coolant-temperature
+    entity_category: config
+    unit_of_measurement: "°C"
+    device_class: temperature
+    min_value: 0
+    max_value: 50
+    step: 0.5
+    update_interval: 10s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[13] / 10.0f;         // 28314
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28314
+          val: !lambda 'return (int) lroundf(x * 10.0f);'
+
+  - platform: template
+    name: "P18 Password 1"
+    icon: mdi:form-textbox-password
+    entity_category: config
+    mode: box
+    min_value: 1
+    max_value: 50
+    step: 1
+    update_interval: 10s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[24];                 // 28325
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28325
+          val: !lambda 'return (int) x;'
+
+  - platform: template
+    name: "P19 Password 2"
+    icon: mdi:form-textbox-password
+    entity_category: config
+    mode: box
+    min_value: 1
+    max_value: 50
+    step: 1
+    update_interval: 10s
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[25];                 // 28326
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28326
+          val: !lambda 'return (int) x;'
+
+select:
+  # atoi() reads the leading number, the text after it is only a label
+  - platform: template
+    name: "Mode"
+    icon: mdi:tune
+    options:
+      - "0 - Auto"
+      - "1 - Cool"
+      - "2 - Dry"
+      - "3 - Fan only"
+      - "4 - Heat"
+    update_interval: 3s
+    lambda: |-
+      if (!id(have_data)) return {};
+      static const char *NAMES[5] = {"0 - Auto", "1 - Cool", "2 - Dry",
+                                     "3 - Fan only", "4 - Heat"};
+      int v = id(rv)[1];                 // 28302
+      if (v < 0 || v > 4) return {};
+      return std::string(NAMES[v]);
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28302
+          val: !lambda 'return atoi(x.c_str());'
+
+  # there is no speed 5
+  - platform: template
+    name: "Fan speed"
+    icon: mdi:fan
+    options:
+      - "2 - Low"
+      - "3 - Medium"
+      - "4 - High"
+      - "6 - Auto"
+    update_interval: 3s
+    lambda: |-
+      if (!id(have_data)) return {};
+      switch (id(rv)[2]) {               // 28303
+        case 2: return std::string("2 - Low");
+        case 3: return std::string("3 - Medium");
+        case 4: return std::string("4 - High");
+        case 6: return std::string("6 - Auto");
+      }
+      return {};
+    set_action:
+      - script.execute:
+          id: write_reg
+          reg: 28303
+          val: !lambda 'return atoi(x.c_str());'
+
+sensor:
+  # Mode as a number, handy for dashboard conditions and automations.
+  - platform: template
+    name: "Mode (number)"
+    lambda: 'return id(have_data) ? id(rv)[1] : NAN;'
+    update_interval: 5s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+  # Read-only: changing it would cut the ESP off from the board.
+  - platform: template
+    name: "P14 Slave address"
+    icon: mdi:identifier
+    lambda: 'return id(have_data) ? id(rv)[20] : NAN;'   # 28321
+    update_interval: 60s
+    accuracy_decimals: 0
+    entity_category: diagnostic
+
+binary_sensor:
+  # Connected while a valid reply arrived within the last 15 seconds.
+  - platform: template
+    name: "Connected"
+    device_class: connectivity
+    lambda: 'return id(have_data) && (millis() - id(last_rx)) < 15000;'
+
+  # Read-only: Fahrenheit would change the unit of every temperature register,
+  # and P13 sets the role of the board in a group of units.
+  - platform: template
+    name: "P12 Display in Fahrenheit"
+    icon: mdi:temperature-fahrenheit
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[18] == 1;            // 28319
+
+  - platform: template
+    name: "P13 Master controller"
+    icon: mdi:crown
+    entity_category: diagnostic
+    lambda: |-
+      if (!id(have_data)) return {};
+      return id(rv)[19] == 1;            // 28320
+
+button:
+  - platform: restart
+    name: "Restart"
